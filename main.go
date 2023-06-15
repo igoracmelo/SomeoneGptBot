@@ -193,7 +193,7 @@ func (c *ctx) sendRandomMedia(chatID int64, msgID int) error {
 func (c *ctx) handleRandom(chatID int64, msgID int) {
 	count := rand.Intn(2) + 1
 	log.Printf("handleRandom() -- %v replies", count)
-
+	time.Sleep(time.Second * time.Duration(rand.Intn(2)+1))
 	type sendFn = func(int64, int) error
 
 	prob := 0.5 / float64(count)
