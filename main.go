@@ -43,23 +43,27 @@ func main() {
 	}, th.CommandEqual("media"))
 
 	c.handler.Handle(func(bot *telego.Bot, u telego.Update) {
-		if u.Message.ReplyToMessage != nil && u.Message.ReplyToMessage.From.Username == botUsername {
-			c.handleRandom(u.Message.Chat.ID, u.Message.MessageID)
-			return
-		}
+		replyMsgID := u.Message.MessageID
+
+		mentionMe := strings.Contains(u.Message.Text, "@"+botUsername)
+		replyToMe := u.Message.ReplyToMessage != nil && u.Message.ReplyToMessage.From.Username == botUsername
+		replyToOther := u.Message.ReplyToMessage != nil && u.Message.ReplyToMessage.From.Username != botUsername
 
 		if u.Message.Chat.Type == "private" {
-			c.handleRandom(u.Message.Chat.ID, u.Message.MessageID)
+			c.handleRandom(u.Message.Chat.ID, replyMsgID)
 			return
 		}
 
-		if strings.Contains(u.Message.Text, "@"+botUsername) {
-			c.handleRandom(u.Message.Chat.ID, u.Message.MessageID)
+		if replyToMe {
+			c.handleRandom(u.Message.Chat.ID, replyMsgID)
 			return
 		}
 
-		if strings.Contains(u.Message.Text, "@"+realUsername) {
-			c.handleRandom(u.Message.Chat.ID, u.Message.MessageID)
+		if mentionMe {
+			if replyToOther {
+				replyMsgID = u.Message.ReplyToMessage.MessageID
+			}
+			c.handleRandom(u.Message.Chat.ID, replyMsgID)
 			return
 		}
 	}, th.AnyMessage())
