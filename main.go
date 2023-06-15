@@ -167,6 +167,7 @@ func (c *ctx) sendRandomMedia(chatID int64, msgID int) error {
 			Animation: telego.InputFile{
 				FileID: m.fileID,
 			},
+			ReplyToMessageID: msgID,
 		})
 		if err != nil {
 			return err
@@ -179,6 +180,7 @@ func (c *ctx) sendRandomMedia(chatID int64, msgID int) error {
 			Sticker: telego.InputFile{
 				FileID: m.fileID,
 			},
+			ReplyToMessageID: msgID,
 		})
 		if err != nil {
 			return err
