@@ -6,10 +6,13 @@ import (
 	"encoding/csv"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"math/rand"
 	"os"
+	"regexp"
 	"strings"
+	"sync"
 	"time"
 	"unicode"
 
@@ -35,12 +38,35 @@ func main() {
 
 	go c.handleStdin()
 
+	// c.handler.Handle(func(bot *telego.Bot, u telego.Update) {
+	// 	err = c.sendRandomMedia(u.Message.Chat.ID, u.Message.MessageID)
+	// 	if err != nil {
+	// 		log.Print(err)
+	// 	}
+	// }, th.CommandEqual("media"))
+
 	c.handler.Handle(func(bot *telego.Bot, u telego.Update) {
-		err = c.sendRandomMedia(u.Message.Chat.ID, u.Message.MessageID)
+		seq := c.chain.makeSequence()
+		txt := ""
+		for _, token := range seq {
+			if len(token) == 1 && unicode.IsPunct([]rune(token)[0]) {
+				txt += token
+			} else {
+				txt += " " + token
+			}
+		}
+
+		_, err := c.bot.SendMessage(&telego.SendMessageParams{
+			ChatID: telego.ChatID{
+				ID: u.Message.Chat.ID,
+			},
+			Text:             txt,
+			ReplyToMessageID: u.Message.MessageID,
+		})
 		if err != nil {
 			log.Print(err)
 		}
-	}, th.CommandEqual("media"))
+	}, th.CommandEqual("markov"))
 
 	c.handler.Handle(func(bot *telego.Bot, u telego.Update) {
 		replyMsgID := u.Message.MessageID
@@ -76,6 +102,8 @@ type ctx struct {
 	handler *th.BotHandler
 	lines   [][]byte
 	medias  []media
+	chatMu  map[int64]*sync.Mutex
+	chain   chain
 }
 
 type media struct {
@@ -83,7 +111,28 @@ type media struct {
 	kind   string
 }
 
+func (c *ctx) lockChat(chatID int64) {
+	mu := c.chatMu[chatID]
+	if mu == nil {
+		mu = new(sync.Mutex)
+		c.chatMu[chatID] = mu
+	}
+	log.Printf("locking chat %v", chatID)
+	mu.Lock()
+}
+
+func (c *ctx) unlockChat(chatID int64) {
+	mu := c.chatMu[chatID]
+	if mu == nil {
+		panic("tried to unlock chat that wasn't locked")
+	}
+	log.Printf("unlocking chat %v", chatID)
+	mu.Unlock()
+}
+
 func (c *ctx) init() error {
+	c.chatMu = map[int64]*sync.Mutex{}
+
 	bot, err := telego.NewBot(token)
 	if err != nil {
 		return err
@@ -106,13 +155,24 @@ func (c *ctx) init() error {
 	}
 	c.handler = h
 
+	f, err := os.Open("messages/" + basename + ".txt")
+	if err != nil {
+		return err
+	}
+
+	t1 := time.Now()
+	c.chain = buildMarkovChain(f)
+	f.Close()
+	took := time.Now().Sub(t1)
+	log.Printf("took %d ms to build markov chain", took.Milliseconds())
+
 	b, err := os.ReadFile("messages/" + basename + ".txt")
 	if err != nil {
 		return err
 	}
 	c.lines = bytes.Split(b, []byte("\n"))
 
-	f, err := os.Open("medias/" + basename + ".csv")
+	f, err = os.Open("medias/" + basename + ".csv")
 	if errors.Is(err, os.ErrNotExist) {
 		c.medias = []media{}
 		return nil
@@ -190,7 +250,37 @@ func (c *ctx) sendRandomMedia(chatID int64, msgID int) error {
 	return nil
 }
 
+func (c *ctx) sendMarkovSequence(chatID int64, msgID int) error {
+	seq := c.chain.makeSequence()
+	txt := ""
+	for _, token := range seq {
+		r := []rune(token)[0]
+		if len(token) == 1 && !unicode.IsDigit(r) && !unicode.IsLetter(r) {
+			txt += token
+		} else {
+			txt += " " + token
+		}
+	}
+
+	log.Printf("markovei: %s", txt)
+
+	_, err := c.bot.SendMessage(&telego.SendMessageParams{
+		ChatID: telego.ChatID{
+			ID: chatID,
+		},
+		Text:             txt,
+		ReplyToMessageID: msgID,
+	})
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
 func (c *ctx) handleRandom(chatID int64, msgID int) {
+	c.lockChat(chatID)
+	defer c.unlockChat(chatID)
+
 	count := rand.Intn(2) + 1
 	log.Printf("handleRandom() -- %v replies", count)
 	time.Sleep(time.Second * time.Duration(rand.Intn(2)+1))
@@ -207,6 +297,8 @@ func (c *ctx) handleRandom(chatID int64, msgID int) {
 			send = c.sendRandomMedia
 			action = "choose_sticker"
 			minSleep = 5
+		} else if rand.Float64() < 0.5 {
+			send = c.sendMarkovSequence
 		}
 
 		_ = c.bot.SendChatAction(&telego.SendChatActionParams{
@@ -237,6 +329,8 @@ func (c *ctx) sendRandomText(chatID int64, msgID int) error {
 		i := rand.Intn(len(c.lines))
 		line = strings.TrimSpace(string(c.lines[i]))
 	}
+
+	log.Printf("do arquivo: %s", line)
 
 	_, err := c.bot.SendMessage(&telego.SendMessageParams{
 		ChatID: telego.ChatID{
@@ -323,4 +417,69 @@ func sanitize(s string) string {
 		}
 	}
 	return strings.TrimSpace(res)
+}
+
+type chain struct {
+	firsts []string
+	data   map[string][]string
+}
+
+func buildMarkovChain(r io.Reader) chain {
+	scanner := bufio.NewScanner(r)
+	re := regexp.MustCompile(`(\p{L}+)|(\S+)`)
+	m := make(map[string][]string)
+	firsts := []string{}
+
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue
+		}
+		tokens := re.FindAllString(line, -1)
+		if len(tokens) == 0 {
+			continue
+		}
+		firsts = append(firsts, tokens[0])
+
+		for i := 0; i < len(tokens)-1; i++ {
+			curr := tokens[i]
+			next := tokens[i+1]
+			m[curr] = append(m[curr], next)
+		}
+	}
+
+	return chain{
+		firsts: firsts,
+		data:   m,
+	}
+}
+
+func (c *chain) makeSequence() []string {
+	res := []string{}
+
+	count := 0
+	for range c.data {
+		count++
+	}
+
+	first := c.firsts[rand.Intn(len(c.firsts))]
+	res = append(res, first)
+	curr := first
+	for {
+		if len(res) > 10 {
+			return c.makeSequence()
+		}
+		choices := c.data[curr]
+		if len(choices) == 0 {
+			break
+		}
+		curr = choices[rand.Intn(len(choices))]
+		res = append(res, curr)
+	}
+
+	if len(res) < 4 {
+		return c.makeSequence()
+	}
+
+	return res
 }
