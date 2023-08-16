@@ -5,38 +5,61 @@ import (
 	"bytes"
 	"encoding/csv"
 	"errors"
+	"flag"
 	"fmt"
 	"io"
 	"log"
 	"math/rand"
 	"os"
 	"regexp"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
 	"unicode"
 
-	"github.com/igoracmelo/SomeoneGptBot/env"
 	"github.com/mymmrac/telego"
 	th "github.com/mymmrac/telego/telegohandler"
 )
 
-var groupID = env.MustInt64("GROUP_ID")
-var basename = env.Must("BASENAME")
-var botUsername = env.Must("BOT_USERNAME")
-var realUsername = env.Must("REAL_USERNAME")
-var token = env.Must("TOKEN")
+var groupID int64
+var basename string
+var botUsername string
+var token string
+var mediaProb float64
+var markovProb float64
+
+func mustNotBeZero[T comparable](name string, t T) {
+	var t2 T
+	if t == t2 {
+		panic(fmt.Sprintf("'%s' is zero ('%+v')", name, t))
+	}
+}
 
 func main() {
+	flag.Int64Var(&groupID, "group", 0, "")
+	flag.StringVar(&token, "token", "", "")
+	flag.StringVar(&basename, "base", "", "")
+	flag.StringVar(&botUsername, "botuser", "", "")
+	flag.Float64Var(&mediaProb, "medp", 0, "")
+	flag.Float64Var(&markovProb, "markp", 0, "")
+	flag.Parse()
+
+	mustNotBeZero("base", basename)
+	mustNotBeZero("botuser", botUsername)
+	mustNotBeZero("token", token)
+
 	c := &ctx{}
 
 	err := c.init()
 	if err != nil {
 		panic(err)
 	}
+
 	defer c.stop()
 
 	go c.handleStdin()
+
 
 	// c.handler.Handle(func(bot *telego.Bot, u telego.Update) {
 	// 	err = c.sendRandomMedia(u.Message.Chat.ID, u.Message.MessageID)
@@ -48,6 +71,7 @@ func main() {
 	c.handler.Handle(func(bot *telego.Bot, u telego.Update) {
 		seq := c.chain.makeSequence()
 		txt := ""
+
 		for _, token := range seq {
 			if len(token) == 1 && unicode.IsPunct([]rune(token)[0]) {
 				txt += token
@@ -69,6 +93,8 @@ func main() {
 	}, th.CommandEqual("markov"))
 
 	c.handler.Handle(func(bot *telego.Bot, u telego.Update) {
+		// if u
+		// log.Print(u.Message.MessageID, " ", u.Message.Text)
 		replyMsgID := u.Message.MessageID
 
 		mentionMe := strings.Contains(u.Message.Text, "@"+botUsername)
@@ -139,10 +165,12 @@ func (c *ctx) init() error {
 	}
 	c.bot = bot
 
-	_, err = bot.GetMe()
-	if err != nil {
-		return err
-	}
+	go func() {
+		_, err = bot.GetMe()
+		if err != nil {
+			panic(err)
+		}
+	}()
 
 	updates, err := bot.UpdatesViaLongPolling(nil)
 	if err != nil {
@@ -286,18 +314,21 @@ func (c *ctx) handleRandom(chatID int64, msgID int) {
 	time.Sleep(time.Second * time.Duration(rand.Intn(2)+1))
 	type sendFn = func(int64, int) error
 
-	prob := 0.5 / float64(count)
+	mediaProb := mediaProb / float64(count)
+	sentMedia := false
 
+	replyIndex := rand.Intn(count)
 	for i := 0; i < count; i++ {
 		var err error
 		var send sendFn = c.sendRandomText
 		action := "typing"
 		minSleep := 3
-		if rand.Float64() < prob && len(c.medias) > 0 {
+		if !sentMedia && rand.Float64() < mediaProb && len(c.medias) > 0 {
 			send = c.sendRandomMedia
 			action = "choose_sticker"
+			sentMedia = true
 			minSleep = 5
-		} else if rand.Float64() < 0.5 {
+		} else if rand.Float64() < markovProb {
 			send = c.sendMarkovSequence
 		}
 
@@ -308,9 +339,10 @@ func (c *ctx) handleRandom(chatID int64, msgID int) {
 			Action: action,
 		})
 
+
 		time.Sleep(time.Second * time.Duration(rand.Intn(3)+minSleep))
 
-		if i == 0 {
+		if i == replyIndex {
 			err = send(chatID, msgID)
 		} else {
 			err = send(chatID, 0)
@@ -427,31 +459,68 @@ type chain struct {
 func buildMarkovChain(r io.Reader) chain {
 	scanner := bufio.NewScanner(r)
 	re := regexp.MustCompile(`(\p{L}+)|(\S+)`)
-	m := make(map[string][]string)
-	firsts := []string{}
+	firstsCh := make(chan string, runtime.NumCPU())
+	tokensCh := make(chan [2]string, runtime.NumCPU())
 
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if line == "" {
-			continue
-		}
-		tokens := re.FindAllString(line, -1)
-		if len(tokens) == 0 {
-			continue
-		}
-		firsts = append(firsts, tokens[0])
+	go func() {
+		limit := make(chan struct{}, runtime.NumCPU())
+		wg := new(sync.WaitGroup)
 
-		for i := 0; i < len(tokens)-1; i++ {
-			curr := tokens[i]
-			next := tokens[i+1]
-			m[curr] = append(m[curr], next)
+		for scanner.Scan() {
+			line := strings.TrimSpace(scanner.Text())
+			if line == "" {
+				continue
+			}
+			limit <- struct{}{}
+			wg.Add(1)
+
+			go func() {
+				defer wg.Done()
+				defer func() { <-limit }()
+				tokens := re.FindAllString(line, -1)
+				if len(tokens) == 0 {
+					return
+				}
+				firstsCh <- tokens[0]
+				for i := 0; i < len(tokens)-1; i++ {
+					curr := tokens[i]
+					next := tokens[i+1]
+					tokensCh <- [2]string{curr, next}
+				}
+			}()
 		}
+
+		wg.Wait()
+		close(firstsCh)
+		close(tokensCh)
+	}()
+
+	chain := chain{
+		firsts: make([]string, 0, 28000),
+		data:   make(map[string][]string, 28000),
 	}
 
-	return chain{
-		firsts: firsts,
-		data:   m,
-	}
+	done := make(chan struct{})
+	go func() {
+		for first := range firstsCh {
+			chain.firsts = append(chain.firsts, first)
+		}
+		done <- struct{}{}
+	}()
+
+	go func() {
+		for pair := range tokensCh {
+			curr := pair[0]
+			next := pair[1]
+			chain.data[curr] = append(chain.data[curr], next)
+		}
+		done <- struct{}{}
+	}()
+
+	<-done
+	<-done
+
+	return chain
 }
 
 func (c *chain) makeSequence() []string {
@@ -470,7 +539,7 @@ func (c *chain) makeSequence() []string {
 			return c.makeSequence()
 		}
 		choices := c.data[curr]
-		if len(choices) == 0 {
+		if len(choices) <= 2 {
 			break
 		}
 		curr = choices[rand.Intn(len(choices))]
